@@ -23,19 +23,21 @@ spec:
           resources:
             requests:
               cpu: "500m"
-              memory: "512Mi"
+              memory: "768Mi"
             limits:
-              cpu: "1000m"
-              memory: "1Gi"
+              cpu: "1500m"
+              memory: "1536Mi"
           livenessProbe:
             httpGet:
               path: /health
               port: 8000
             initialDelaySeconds: 30
             periodSeconds: 30
+            timeoutSeconds: 10
           readinessProbe:
             httpGet:
               path: /health
               port: 8000
             initialDelaySeconds: 15
             periodSeconds: 15
+            timeoutSeconds: 10

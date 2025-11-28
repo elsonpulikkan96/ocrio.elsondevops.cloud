@@ -2,7 +2,8 @@ from pathlib import Path
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from PIL import Image, ImageOps, ImageEnhance, ImageFilter
+from fastapi.staticfiles import StaticFiles
+from PIL import Image, ImageOps, ImageEnhance
 import pytesseract
 import io
 from pyzbar import pyzbar
@@ -12,8 +13,9 @@ import re
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_INDEX = BASE_DIR / "frontend" / "index.html"
+STATIC_DIR = BASE_DIR / "app" / "static"
 
-app = FastAPI(title="OCR IO", version="6.0.0")
+app = FastAPI(title="OCR IO", version="7.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,6 +23,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -44,179 +49,120 @@ def detect_qr_barcodes(image):
         return []
 
 
-def preprocess_method_1(img):
-    """Method 1: High contrast binary"""
+def preprocess_image(img, method='adaptive'):
+    """Enhanced preprocessing methods"""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-    _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return binary
-
-
-def preprocess_method_2(img):
-    """Method 2: Adaptive threshold"""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    denoised = cv2.GaussianBlur(gray, (5, 5), 0)
-    binary = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-    return binary
-
-
-def preprocess_method_3(img):
-    """Method 3: CLAHE + morphology"""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kernel = np.ones((2, 2), np.uint8)
-    cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    return cleaned
-
-
-def is_valid_text(text):
-    """Check if extracted text is valid (not garbled)"""
-    if not text or len(text) < 3:
-        return False
     
-    # Count alphanumeric characters
-    alnum_count = sum(c.isalnum() or c.isspace() for c in text)
-    total_chars = len(text)
+    if method == 'otsu':
+        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+        _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return binary
     
-    # If less than 50% are valid characters, it's probably garbled
-    if total_chars > 0 and (alnum_count / total_chars) < 0.5:
-        return False
+    elif method == 'adaptive':
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        binary = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+        return binary
     
-    # Check for excessive special characters
-    special_count = sum(not c.isalnum() and not c.isspace() and c not in '.,!?@#$%&*()-_=+[]{}:;"\'' for c in text)
-    if special_count > (total_chars * 0.3):
-        return False
+    elif method == 'clahe':
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        kernel = np.ones((1, 1), np.uint8)
+        cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        return cleaned
     
-    return True
+    elif method == 'sharpen':
+        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        sharpened = cv2.filter2D(gray, -1, kernel)
+        _, binary = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return binary
+    
+    return gray
 
 
-def clean_text(text):
-    """Clean extracted text"""
-    # Remove excessive whitespace
-    text = re.sub(r'\s+', ' ', text)
-    # Remove lines with too many special characters
+def clean_ocr_text(text):
+    """Clean and format OCR output"""
+    if not text:
+        return ""
+    
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
+    
     lines = text.split('\n')
-    cleaned_lines = []
+    cleaned = []
+    
     for line in lines:
-        if line.strip() and is_valid_text(line):
-            cleaned_lines.append(line.strip())
-    return '\n'.join(cleaned_lines)
+        line = line.strip()
+        if not line or len(line) < 2:
+            continue
+        
+        # More lenient: accept if >25% alphanumeric (was 40%)
+        alnum = sum(c.isalnum() or c.isspace() for c in line)
+        if len(line) > 0 and (alnum / len(line)) < 0.25:
+            continue
+        
+        cleaned.append(line)
+    
+    return '\n'.join(cleaned)
 
 
-def extract_text_multi_method(image):
-    """Try multiple preprocessing methods and return best result"""
-    # Convert PIL to OpenCV
+def extract_text_advanced(image):
+    """Optimized single-method OCR extraction"""
     img = np.array(image)
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     
-    # Upscale
-    height, width = img.shape[:2]
-    if width < 2000 or height < 2000:
-        scale = max(2000 / width, 2000 / height)
+    # Moderate upscaling
+    h, w = img.shape[:2]
+    if w < 800 or h < 800:
+        scale = min(800 / w, 800 / h)
         img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     
-    results = []
-    
-    # Try method 1
-    try:
-        processed = preprocess_method_1(img.copy())
-        config = '--oem 3 --psm 1'
-        text = pytesseract.image_to_string(processed, config=config)
-        if is_valid_text(text):
-            results.append(('method1', clean_text(text)))
-    except:
-        pass
-    
-    # Try method 2
-    try:
-        processed = preprocess_method_2(img.copy())
-        config = '--oem 3 --psm 3'
-        text = pytesseract.image_to_string(processed, config=config)
-        if is_valid_text(text):
-            results.append(('method2', clean_text(text)))
-    except:
-        pass
-    
-    # Try method 3
-    try:
-        processed = preprocess_method_3(img.copy())
-        config = '--oem 3 --psm 6'
-        text = pytesseract.image_to_string(processed, config=config)
-        if is_valid_text(text):
-            results.append(('method3', clean_text(text)))
-    except:
-        pass
-    
-    # Try with original (minimal processing)
+    # Single optimized method
     try:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        config = '--oem 3 --psm 1'
-        text = pytesseract.image_to_string(gray, config=config)
-        if is_valid_text(text):
-            results.append(('original', clean_text(text)))
+        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+        binary = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+        text = pytesseract.image_to_string(binary, config='--oem 3 --psm 3')
+        return clean_ocr_text(text)
     except:
-        pass
-    
-    if not results:
         return ""
-    
-    # Return longest valid result
-    best = max(results, key=lambda x: len(x[1]))
-    return best[1]
 
 
 @app.post("/api/ocr")
 async def ocr_image(file: UploadFile = File(...)):
-    """Multi-method OCR with validation"""
-    
+    """Enhanced OCR processing"""
     try:
         raw = await file.read()
         if not raw:
-            raise HTTPException(status_code=400, detail="Empty file")
+            return {"text": "(Empty file uploaded)"}
         
-        # Load image
         image = Image.open(io.BytesIO(raw))
-        
-        # Auto-orient
         image = ImageOps.exif_transpose(image)
         
-        # Convert to RGB
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
-        # Detect QR/barcodes
-        qr_barcode_data = detect_qr_barcodes(image)
+        qr_data = detect_qr_barcodes(image)
+        ocr_text = extract_text_advanced(image)
         
-        # Extract text with multiple methods
-        ocr_text = extract_text_multi_method(image)
-        
-        # Combine results
-        result_parts = []
-        
-        if qr_barcode_data:
-            result_parts.append("=== QR CODES / BARCODES ===")
-            result_parts.extend(qr_barcode_data)
-            result_parts.append("")
+        output = []
+        if qr_data:
+            output.append("=== QR CODES / BARCODES ===")
+            output.extend(qr_data)
+            output.append("")
         
         if ocr_text:
-            if qr_barcode_data:
-                result_parts.append("=== TEXT CONTENT ===")
-            result_parts.append(ocr_text)
+            if qr_data:
+                output.append("=== EXTRACTED TEXT ===")
+            output.append(ocr_text)
         
-        final_text = "\n".join(result_parts).strip()
-        
-        if not final_text:
-            return {"text": "(No clear text detected. Image quality may be too low or text is too small/blurry)"}
-        
-        return {"text": final_text}
+        final = "\n".join(output).strip()
+        return {"text": final if final else "(No readable text detected. Try a clearer image)"}
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+        return {"text": f"(Error: {str(e)[:100]})"}
 
 
 @app.get("/health")
 async def health_check():
-    """Health check"""
-    return {"status": "healthy", "version": "6.0.0", "engine": "Multi-Method OCR"}
+    return {"status": "healthy", "version": "7.0.0", "engine": "Advanced OCR"}
