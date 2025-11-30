@@ -87,12 +87,18 @@ def preprocess_image(img, method='adaptive'):
 
 
 def clean_ocr_text(text):
-    """Clean and format OCR output"""
+    """Enhanced text cleaning and formatting"""
     if not text:
         return ""
     
+    # Remove excessive spaces
     text = re.sub(r'[ \t]+', ' ', text)
     text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
+    
+    # Fix common OCR errors
+    text = text.replace('|', 'I')  # Common pipe/I confusion
+    text = text.replace('0', 'O') if text.isupper() else text  # 0/O in uppercase
+    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)  # Add space between camelCase
     
     lines = text.split('\n')
     cleaned = []
@@ -102,18 +108,27 @@ def clean_ocr_text(text):
         if not line or len(line) < 2:
             continue
         
-        # More lenient: accept if >25% alphanumeric (was 40%)
-        alnum = sum(c.isalnum() or c.isspace() for c in line)
-        if len(line) > 0 and (alnum / len(line)) < 0.25:
+        # Remove lines with too many special characters
+        special_count = sum(not c.isalnum() and not c.isspace() for c in line)
+        if len(line) > 0 and (special_count / len(line)) > 0.5:
             continue
         
-        cleaned.append(line)
+        # Keep lines with reasonable alphanumeric content
+        alnum = sum(c.isalnum() or c.isspace() for c in line)
+        if len(line) > 0 and (alnum / len(line)) >= 0.4:
+            cleaned.append(line)
     
-    return '\n'.join(cleaned)
+    result = '\n'.join(cleaned)
+    
+    # Fix spacing around punctuation
+    result = re.sub(r'\s+([.,!?;:])', r'\1', result)
+    result = re.sub(r'([.,!?;:])\s*([a-zA-Z])', r'\1 \2', result)
+    
+    return result
 
 
 def extract_text_advanced(image):
-    """Multi-method OCR with best result selection"""
+    """Enhanced OCR with better preprocessing"""
     try:
         img = np.array(image)
         if len(img.shape) == 2:
@@ -121,50 +136,35 @@ def extract_text_advanced(image):
         elif img.shape[2] == 4:
             img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
         
-        # Smart upscaling
+        # Aggressive upscaling for better quality
         h, w = img.shape[:2]
-        if w < 1000 or h < 1000:
-            scale = min(1000 / w, 1000 / h)
+        if w < 1500 or h < 1500:
+            scale = min(1500 / w, 1500 / h)
             img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         
-        # Deskew
+        # Convert to grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        coords = np.column_stack(np.where(gray > 0))
-        if len(coords) > 0:
-            angle = cv2.minAreaRect(coords)[-1]
-            if angle < -45:
-                angle = -(90 + angle)
-            else:
-                angle = -angle
-            if abs(angle) > 0.5:
-                (h, w) = img.shape[:2]
-                center = (w // 2, h // 2)
-                M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
         
-        # Try multiple methods
-        methods = [
-            ('adaptive', '--oem 3 --psm 3'),
-            ('clahe', '--oem 3 --psm 6'),
-            ('otsu', '--oem 3 --psm 4'),
-        ]
+        # Denoise
+        denoised = cv2.fastNlMeansDenoising(gray, None, h=10, templateWindowSize=7, searchWindowSize=21)
         
-        results = []
-        for method, config in methods:
-            try:
-                processed = preprocess_image(img, method)
-                text = pytesseract.image_to_string(processed, config=config)
-                cleaned = clean_ocr_text(text)
-                if cleaned:
-                    results.append((len(cleaned), cleaned))
-            except:
-                continue
+        # Enhance contrast with CLAHE
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(denoised)
         
-        if results:
-            results.sort(reverse=True)
-            return results[0][1]
+        # Adaptive thresholding
+        binary = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
         
-        return ""
+        # Morphological operations to clean up
+        kernel = np.ones((1, 1), np.uint8)
+        cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
+        
+        # Run Tesseract with best config
+        custom_config = r'--oem 3 --psm 6 -c preserve_interword_spaces=1'
+        text = pytesseract.image_to_string(cleaned, config=custom_config)
+        
+        return clean_ocr_text(text)
     except Exception as e:
         return f"Processing error: {str(e)[:50]}"
 
