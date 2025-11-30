@@ -15,7 +15,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_INDEX = BASE_DIR / "frontend" / "index.html"
 STATIC_DIR = BASE_DIR / "app" / "static"
 
-app = FastAPI(title="OCR IO", version="7.0.0")
+app = FastAPI(title="OCR IO", version="8.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,34 +50,40 @@ def detect_qr_barcodes(image):
 
 
 def preprocess_image(img, method='adaptive'):
-    """Enhanced preprocessing methods"""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    if method == 'otsu':
-        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-        _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        return binary
-    
-    elif method == 'adaptive':
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        binary = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-        return binary
-    
-    elif method == 'clahe':
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-        _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        kernel = np.ones((1, 1), np.uint8)
-        cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-        return cleaned
-    
-    elif method == 'sharpen':
-        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-        sharpened = cv2.filter2D(gray, -1, kernel)
-        _, binary = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        return binary
-    
-    return gray
+    """Advanced preprocessing with error handling"""
+    try:
+        if len(img.shape) == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img
+        
+        if method == 'otsu':
+            denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+            _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            return binary
+        
+        elif method == 'adaptive':
+            blur = cv2.GaussianBlur(gray, (5, 5), 0)
+            binary = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+            return binary
+        
+        elif method == 'clahe':
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+            _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            kernel = np.ones((2, 2), np.uint8)
+            cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+            return cleaned
+        
+        elif method == 'sharpen':
+            kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+            sharpened = cv2.filter2D(gray, -1, kernel)
+            _, binary = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            return binary
+        
+        return gray
+    except Exception as e:
+        return gray if 'gray' in locals() else img
 
 
 def clean_ocr_text(text):
@@ -107,62 +113,136 @@ def clean_ocr_text(text):
 
 
 def extract_text_advanced(image):
-    """Optimized single-method OCR extraction"""
-    img = np.array(image)
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    
-    # Moderate upscaling
-    h, w = img.shape[:2]
-    if w < 800 or h < 800:
-        scale = min(800 / w, 800 / h)
-        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    
-    # Single optimized method
+    """Multi-method OCR with best result selection"""
     try:
+        img = np.array(image)
+        if len(img.shape) == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        
+        # Smart upscaling
+        h, w = img.shape[:2]
+        if w < 1000 or h < 1000:
+            scale = min(1000 / w, 1000 / h)
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        
+        # Deskew
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (3, 3), 0)
-        binary = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-        text = pytesseract.image_to_string(binary, config='--oem 3 --psm 3')
-        return clean_ocr_text(text)
-    except:
+        coords = np.column_stack(np.where(gray > 0))
+        if len(coords) > 0:
+            angle = cv2.minAreaRect(coords)[-1]
+            if angle < -45:
+                angle = -(90 + angle)
+            else:
+                angle = -angle
+            if abs(angle) > 0.5:
+                (h, w) = img.shape[:2]
+                center = (w // 2, h // 2)
+                M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        
+        # Try multiple methods
+        methods = [
+            ('adaptive', '--oem 3 --psm 3'),
+            ('clahe', '--oem 3 --psm 6'),
+            ('otsu', '--oem 3 --psm 4'),
+        ]
+        
+        results = []
+        for method, config in methods:
+            try:
+                processed = preprocess_image(img, method)
+                text = pytesseract.image_to_string(processed, config=config)
+                cleaned = clean_ocr_text(text)
+                if cleaned:
+                    results.append((len(cleaned), cleaned))
+            except:
+                continue
+        
+        if results:
+            results.sort(reverse=True)
+            return results[0][1]
+        
         return ""
+    except Exception as e:
+        return f"Processing error: {str(e)[:50]}"
 
 
 @app.post("/api/ocr")
 async def ocr_image(file: UploadFile = File(...)):
-    """Enhanced OCR processing"""
+    """Enhanced OCR with robust error handling"""
     try:
-        raw = await file.read()
-        if not raw:
-            return {"text": "(Empty file uploaded)"}
+        # Validate file
+        if not file.filename:
+            return {"text": "(No file provided)"}
         
-        image = Image.open(io.BytesIO(raw))
+        # Check file extension
+        ext = file.filename.lower().split('.')[-1]
+        if ext not in ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp']:
+            return {"text": f"(Unsupported format: {ext}. Use JPG, PNG, BMP, TIFF, or WEBP)"}
+        
+        raw = await file.read()
+        if not raw or len(raw) < 100:
+            return {"text": "(File is empty or too small)"}
+        
+        # Size check
+        if len(raw) > 10 * 1024 * 1024:
+            return {"text": "(File too large. Max 10MB)"}
+        
+        # Load image
+        try:
+            image = Image.open(io.BytesIO(raw))
+        except Exception as e:
+            return {"text": f"(Cannot open image: {str(e)[:50]})"}
+        
+        # Fix orientation
         image = ImageOps.exif_transpose(image)
         
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
+        # Convert to RGB
+        if image.mode not in ['RGB', 'L']:
+            try:
+                image = image.convert('RGB')
+            except:
+                return {"text": "(Cannot convert image format)"}
         
+        # Detect QR/Barcodes
         qr_data = detect_qr_barcodes(image)
+        
+        # Extract text
         ocr_text = extract_text_advanced(image)
         
+        # Build output
         output = []
         if qr_data:
             output.append("=== QR CODES / BARCODES ===")
             output.extend(qr_data)
             output.append("")
         
-        if ocr_text:
+        if ocr_text and not ocr_text.startswith("Processing error"):
             if qr_data:
                 output.append("=== EXTRACTED TEXT ===")
             output.append(ocr_text)
+        elif ocr_text.startswith("Processing error"):
+            output.append(ocr_text)
         
         final = "\n".join(output).strip()
-        return {"text": final if final else "(No readable text detected. Try a clearer image)"}
+        
+        if not final:
+            return {"text": "(No readable text detected. Try:\n• Higher resolution image\n• Better lighting\n• Clearer text\n• Different angle)"}
+        
+        return {"text": final}
         
     except Exception as e:
-        return {"text": f"(Error: {str(e)[:100]})"}
+        return {"text": f"(Error: {str(e)[:100]}. Please try a different image)"}
+
 
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "version": "7.0.0", "engine": "Advanced OCR"}
+    return {
+        "status": "healthy",
+        "version": "8.0.0",
+        "engine": "Advanced OCR v8",
+        "features": ["Multi-method processing", "Auto-deskew", "Smart upscaling", "Enhanced error handling"]
+    }
